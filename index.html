@@ -435,41 +435,93 @@
 
     <!-- Canvas -->
     <div class="canvas-area" id="carea">
-      <canvas id="c"></canvas>
+      <!-- #c is the offscreen worker target; #display is what the user sees -->
+      <canvas id="c" style="display:none"></canvas>
+      <canvas id="display" style="width:100%;height:100%;display:block;object-fit:contain"></canvas>
     </div>
 
   </div>
 </div>
 
 <script>
-  const cv  = document.getElementById('c');
-  const ctx = cv.getContext('2d');
-  const carea = document.getElementById('carea');
-  const get = id => document.getElementById(id);
-  const val = id => parseFloat(get(id).value);
+  // ── Elements ───────────────────────────────────────────────────────────
+  const workerCanvas  = document.getElementById('c');         // hidden, given to worker
+  const displayCanvas = document.getElementById('display');   // visible to user
+  const carea         = document.getElementById('carea');
+  const get  = id => document.getElementById(id);
+  const val  = id => parseFloat(get(id).value);
 
+  // ── State ──────────────────────────────────────────────────────────────
+  let displayCtx  = displayCanvas.getContext('2d');
+  let mainCtx     = null;   // fallback: draw directly on displayCanvas
+  let worker      = null;
+  let useWorker   = false;
+  let lastSVGData = null;
+  let pendingDraw = false;
+
+  const TWO_PI  = Math.PI * 2;
+  const HALF_PI = Math.PI / 2;
+
+  // ── Worker ─────────────────────────────────────────────────────────────
+  function initWorker() {
+    if (!window.OffscreenCanvas || !workerCanvas.transferControlToOffscreen) return;
+    try {
+      worker    = new Worker('worker.js');
+      useWorker = true;
+      const offscreen = workerCanvas.transferControlToOffscreen();
+      worker.postMessage({ type: 'init', data: { canvas: offscreen } }, [offscreen]);
+      worker.onmessage = function(e) {
+        if (e.data.type !== 'frame') return;
+        const { bitmap, svgLetters, fontFamily } = e.data;
+        // Blit bitmap onto visible display canvas
+        const dpr = window.devicePixelRatio || 1;
+        const W   = carea.offsetWidth;
+        const H   = carea.offsetHeight;
+        if (displayCanvas.width !== W * dpr) {
+          displayCanvas.width  = W * dpr;
+          displayCanvas.height = H * dpr;
+          displayCanvas.style.width  = W + 'px';
+          displayCanvas.style.height = H + 'px';
+        }
+        displayCtx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        lastSVGData = {
+          W: bitmap.width  / dpr,
+          H: bitmap.height / dpr,
+          bg: get('bg').value, textColor: get('tc').value,
+          fontFamily, letters: svgLetters
+        };
+      };
+    } catch(err) {
+      useWorker = false; worker = null;
+      workerCanvas.style.display = 'none';
+      mainCtx = displayCanvas.getContext('2d');
+    }
+  }
+
+  // ── Canvas sizing ──────────────────────────────────────────────────────
   function resizeCanvas() {
     const dpr = window.devicePixelRatio || 1;
-    const W = carea.offsetWidth;
-    const H = carea.offsetHeight;
-    cv.width  = W * dpr;
-    cv.height = H * dpr;
-    cv.style.width  = W + 'px';
-    cv.style.height = H + 'px';
-    draw();
+    const W   = carea.offsetWidth;
+    const H   = carea.offsetHeight;
+    displayCanvas.width  = W * dpr;
+    displayCanvas.height = H * dpr;
+    displayCanvas.style.width  = W + 'px';
+    displayCanvas.style.height = H + 'px';
+    if (!useWorker && mainCtx) {
+      // mainCtx IS displayCanvas — sizing already done above
+    }
+    scheduleDraw();
   }
 
-  // RAF-based scheduler — draw() runs at most once per animation frame
-  let _rafPending = false;
+  // ── Scheduler ─────────────────────────────────────────────────────────
   function scheduleDraw() {
-    if (_rafPending) return;
-    _rafPending = true;
-    requestAnimationFrame(() => {
-      _rafPending = false;
-      draw();
-    });
+    if (pendingDraw) return;
+    pendingDraw = true;
+    requestAnimationFrame(() => { pendingDraw = false; draw(); });
   }
 
+  // ── Bindings ──────────────────────────────────────────────────────────
   function bind(id, outId, dec = 0) {
     const el = get(id), out = get(outId);
     out.textContent = parseFloat(el.value).toFixed(dec);
@@ -478,7 +530,6 @@
       scheduleDraw();
     });
   }
-
   bind('rings',   'rings-out',   0);
   bind('gap',     'gap-out',     0);
   bind('startR',  'startR-out',  0);
@@ -488,148 +539,141 @@
   bind('fadeW',   'fadeW-out',   2);
   bind('fadePos', 'fadePos-out', 2);
   bind('shrink',  'shrink-out',  2);
-
   get('txt').addEventListener('input', scheduleDraw);
   get('font').addEventListener('change', scheduleDraw);
   get('uppercase').addEventListener('change', scheduleDraw);
   get('bg').addEventListener('input', e => { carea.style.background = e.target.value; scheduleDraw(); });
   get('tc').addEventListener('input', scheduleDraw);
 
+  // ── Helpers ───────────────────────────────────────────────────────────
   function hexToRgb(hex) {
-    return [
-      parseInt(hex.slice(1, 3), 16),
-      parseInt(hex.slice(3, 5), 16),
-      parseInt(hex.slice(5, 7), 16)
-    ];
+    return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
   }
 
-  let lastSVGData = null;
-
-  function draw() {
+  function buildParams() {
     const dpr = window.devicePixelRatio || 1;
-    const W = cv.width / dpr, H = cv.height / dpr;
-    const cx0 = W / 2, cy0 = H / 2;
+    const W   = carea.offsetWidth;
+    const H   = carea.offsetHeight;
+    let rawText = get('txt').value.replace(/\s+/g,' ').trim() || 'Typoverse';
+    if (get('uppercase').checked) rawText = rawText.toUpperCase();
+    const [tr,tg,tb] = hexToRgb(get('tc').value);
+    return {
+      width: W*dpr, height: H*dpr, dpr,
+      numRings:    Math.round(val('rings')),
+      ringGap:     val('gap'),
+      startRadius: val('startR'),
+      baseFontSize:val('fsize'),
+      fadeStr:     val('fade'),
+      fadeWidth:   val('fadeW'),
+      fadePosFrac: val('fadePos'),
+      shrinkStr:   val('shrink'),
+      lsMult:      val('spacing'),
+      fontFamily:  get('font').value,
+      bg:          get('bg').value,
+      tr, tg, tb,
+      textChars:   rawText.split('').filter(c => c !== ' ')
+    };
+  }
 
-    const numRings     = Math.round(val('rings'));
-    const ringGap      = val('gap');
-    const startRadius  = val('startR');
-    const baseFontSize = val('fsize');
-    const fadeStr      = val('fade');
-    const fadeWidth    = val('fadeW');
-    const fadePosFrac  = val('fadePos');
-    const shrinkStr    = val('shrink');
-    const lsMult       = val('spacing');
-    const fontFamily   = get('font').value;
-    const bg           = get('bg').value;
-    const [tr, tg, tb] = hexToRgb(get('tc').value);
-    const uppercase    = get('uppercase').checked;
+  // ── Draw ──────────────────────────────────────────────────────────────
+  function draw() {
+    const p = buildParams();
 
-    let rawText = get('txt').value.replace(/\s+/g, ' ').trim() || 'Typoverse';
-    if (uppercase) rawText = rawText.toUpperCase();
-    const textChars = rawText.split('').filter(c => c !== ' ');
+    if (useWorker && worker) {
+      worker.postMessage({ type: 'draw', data: p });
+      return;
+    }
 
-    // Clear canvas — work in raw pixel space, apply dpr via setTransform per letter
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // Main-thread fallback
+    const { width, height, dpr, numRings, ringGap, startRadius,
+            baseFontSize, fadeStr, fadeWidth, fadePosFrac, shrinkStr,
+            lsMult, fontFamily, bg, tr, tg, tb, textChars } = p;
+
+    const ctx  = mainCtx || displayCtx;
+    const cx0  = width  / 2 / dpr;
+    const cy0  = height / 2 / dpr;
+
+    ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillRect(0, 0, width, height);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = `rgb(${tr},${tg},${tb})`;
 
-    // Fixed state — set once
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle    = `rgb(${tr},${tg},${tb})`;
-
-    const svgLetters   = [];
     const fadeWClamped = Math.max(0.001, fadeWidth);
-    const TWO_PI       = Math.PI * 2;
-    const HALF_PI      = Math.PI / 2;
-    let   lastAlpha    = -1;
-    let   lastFont     = '';
+    const svgLetters   = [];
+    let lastAlpha = -1, lastFont = '';
 
     for (let ring = 0; ring < numRings; ring++) {
       const radius   = startRadius + ring * ringGap;
       const circ     = TWO_PI * radius;
-      const avgW     = baseFontSize * 0.52 * lsMult;
-      const numChars = Math.max(3, Math.floor(circ / avgW));
-      const ringT    = numRings > 1 ? ring / (numRings - 1) : 0;
-      const rScale   = 0.75 + 0.25 * (1 - ringT);
+      const numChars = Math.max(3, Math.floor(circ / (baseFontSize * 0.52 * lsMult)));
+      const rScale   = 0.75 + 0.25 * (1 - (numRings > 1 ? ring/(numRings-1) : 0));
 
       for (let i = 0; i < numChars; i++) {
         const cf    = i / numChars;
         const angle = cf * TWO_PI - HALF_PI;
-
-        const d1 = Math.abs(((cf - fadePosFrac + 1.5) % 1) - 0.5) * 2;
-        const d2 = Math.abs(((cf - (fadePosFrac + 0.5) + 1.5) % 1) - 0.5) * 2;
-        const ff  = Math.max(
-          Math.max(0, 1 - d1 / fadeWClamped),
-          Math.max(0, 1 - d2 / fadeWClamped)
-        );
-
-        const alpha = Math.max(0, Math.min(1, 1 - fadeStr * ff));
+        const d1    = Math.abs(((cf - fadePosFrac + 1.5) % 1) - 0.5) * 2;
+        const d2    = Math.abs(((cf - (fadePosFrac+0.5) + 1.5) % 1) - 0.5) * 2;
+        const ff    = Math.max(Math.max(0, 1-d1/fadeWClamped), Math.max(0, 1-d2/fadeWClamped));
+        const alpha = 1 - fadeStr * ff;
         if (alpha < 0.005) continue;
 
         const fontSize = baseFontSize * rScale * (1 - shrinkStr * ff);
-        const ch       = textChars[(ring * 13 + i) % textChars.length];
+        const ch       = textChars[(ring*13+i) % textChars.length];
         const wx       = cx0 + Math.cos(angle) * radius;
         const wy       = cy0 + Math.sin(angle) * radius;
         const rot      = angle + HALF_PI;
-        const cos      = Math.cos(rot);
-        const sin      = Math.sin(rot);
+        const cosR     = Math.cos(rot), sinR = Math.sin(rot);
 
-        // Only update when value changes
         const fontStr = `${fontSize.toFixed(1)}px ${fontFamily}`;
         if (fontStr !== lastFont) { ctx.font = fontStr; lastFont = fontStr; }
-
-        const alphaR = (alpha * 1000 | 0) / 1000;
+        const alphaR = (alpha*1000|0)/1000;
         if (alphaR !== lastAlpha) { ctx.globalAlpha = alphaR; lastAlpha = alphaR; }
 
-        // No save/restore — encode position+rotation directly into transform matrix
-        ctx.setTransform(cos * dpr, sin * dpr, -sin * dpr, cos * dpr, wx * dpr, wy * dpr);
+        ctx.setTransform(cosR*dpr, sinR*dpr, -sinR*dpr, cosR*dpr, wx*dpr, wy*dpr);
         ctx.fillText(ch, 0, 0);
-
-        svgLetters.push({ x: wx, y: wy, angle, fontSize, alpha, ch, fontFamily });
+        svgLetters.push({ x:wx, y:wy, angle, fontSize, alpha:alphaR, ch });
       }
     }
-
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.setTransform(1,0,0,1,0,0);
     ctx.globalAlpha = 1;
-    lastSVGData = { W, H, bg, textColor: get('tc').value, letters: svgLetters };
+    lastSVGData = { W:width/dpr, H:height/dpr, bg, textColor:get('tc').value, fontFamily, letters:svgLetters };
   }
 
+  // ── Export ────────────────────────────────────────────────────────────
   function exportAs(fmt) {
     if (!lastSVGData) return;
-    const { W, H, bg, textColor, letters } = lastSVGData;
+    const { W, H, bg, textColor, fontFamily, letters } = lastSVGData;
 
     if (fmt === 'svg') {
+      const fam = fontFamily.split(',')[0].trim().replace(/'/g,'');
       let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(W)}" height="${Math.round(H)}" viewBox="0 0 ${Math.round(W)} ${Math.round(H)}">`;
       s += `<rect width="${Math.round(W)}" height="${Math.round(H)}" fill="${bg}"/>`;
-      for (const { x, y, angle, fontSize, alpha, ch, fontFamily } of letters) {
-        const deg = ((angle + Math.PI / 2) * 180 / Math.PI).toFixed(2);
-        const fam = fontFamily.split(',')[0].trim().replace(/'/g, '');
-        const esc = ch.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        s += `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" text-anchor="middle" dominant-baseline="middle" font-family="${fam}" font-size="${fontSize.toFixed(2)}" fill="${textColor}" opacity="${alpha.toFixed(3)}" transform="rotate(${deg},${x.toFixed(2)},${y.toFixed(2)})">${esc}</text>`;
+      for (const { x, y, angle, fontSize, alpha, ch } of letters) {
+        const deg = ((angle+HALF_PI)*180/Math.PI).toFixed(2);
+        const esc = ch.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const fam2 = fontFamily.split(',')[0].trim().replace(/'/g,'');
+        s += `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" text-anchor="middle" dominant-baseline="middle" font-family="${fam2}" font-size="${fontSize.toFixed(2)}" fill="${textColor}" opacity="${alpha.toFixed(3)}" transform="rotate(${deg},${x.toFixed(2)},${y.toFixed(2)})">${esc}</text>`;
       }
-      s += `</svg>`;
+      s += '</svg>';
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([s], { type: 'image/svg+xml' }));
-      a.download = 'typoverse.svg';
-      a.click();
+      a.href = URL.createObjectURL(new Blob([s],{type:'image/svg+xml'}));
+      a.download = 'typoverse.svg'; a.click();
     } else {
-      const exp = document.createElement('canvas');
-      exp.width  = cv.width;
-      exp.height = cv.height;
-      exp.getContext('2d').drawImage(cv, 0, 0);
+      const dpr  = window.devicePixelRatio || 1;
+      const exp  = document.createElement('canvas');
+      exp.width  = Math.round(W) * dpr;
+      exp.height = Math.round(H) * dpr;
+      exp.getContext('2d').drawImage(displayCanvas, 0, 0);
       const a = document.createElement('a');
-      a.href     = exp.toDataURL(fmt === 'jpg' ? 'image/jpeg' : 'image/png', 0.95);
-      a.download = `typoverse.${fmt}`;
-      a.click();
+      a.href     = exp.toDataURL(fmt==='jpg'?'image/jpeg':'image/png', 0.95);
+      a.download = `typoverse.${fmt}`; a.click();
     }
   }
 
-  window.addEventListener('resize', () => {
-    clearTimeout(window._rt);
-    window._rt = setTimeout(resizeCanvas, 60);
-  });
-
+  // ── Boot ─────────────────────────────────────────────────────────────
+  window.addEventListener('resize', () => { clearTimeout(window._rt); window._rt = setTimeout(resizeCanvas, 60); });
+  initWorker();
   setTimeout(resizeCanvas, 80);
 </script>
 
