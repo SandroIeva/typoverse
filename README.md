@@ -6,10 +6,6 @@ Open `index.html` in any modern browser — no build step, no dependencies, no s
 
 ---
 
-![Typoverse Preview](preview.png)
-
----
-
 ## What you can do
 
 ### Text
