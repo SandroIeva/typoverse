@@ -459,12 +459,23 @@
     draw();
   }
 
+  // RAF-based scheduler — draw() runs at most once per animation frame
+  let _rafPending = false;
+  function scheduleDraw() {
+    if (_rafPending) return;
+    _rafPending = true;
+    requestAnimationFrame(() => {
+      _rafPending = false;
+      draw();
+    });
+  }
+
   function bind(id, outId, dec = 0) {
     const el = get(id), out = get(outId);
     out.textContent = parseFloat(el.value).toFixed(dec);
     el.addEventListener('input', () => {
       out.textContent = parseFloat(el.value).toFixed(dec);
-      draw();
+      scheduleDraw();
     });
   }
 
@@ -478,11 +489,11 @@
   bind('fadePos', 'fadePos-out', 2);
   bind('shrink',  'shrink-out',  2);
 
-  get('txt').addEventListener('input', draw);
-  get('font').addEventListener('change', draw);
-  get('uppercase').addEventListener('change', draw);
-  get('bg').addEventListener('input', e => { carea.style.background = e.target.value; draw(); });
-  get('tc').addEventListener('input', draw);
+  get('txt').addEventListener('input', scheduleDraw);
+  get('font').addEventListener('change', scheduleDraw);
+  get('uppercase').addEventListener('change', scheduleDraw);
+  get('bg').addEventListener('input', e => { carea.style.background = e.target.value; scheduleDraw(); });
+  get('tc').addEventListener('input', scheduleDraw);
 
   function hexToRgb(hex) {
     return [
@@ -522,14 +533,20 @@
     ctx.fillRect(0, 0, W, H);
 
     const svgLetters = [];
+    const fadeWClamped = Math.max(0.001, fadeWidth);
+
+    // Set non-changing canvas state once
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
 
     for (let ring = 0; ring < numRings; ring++) {
-      const radius = startRadius + ring * ringGap;
-      const circ   = 2 * Math.PI * radius;
-      const avgW   = baseFontSize * 0.52 * lsMult;
+      const radius   = startRadius + ring * ringGap;
+      const circ     = 2 * Math.PI * radius;
+      const avgW     = baseFontSize * 0.52 * lsMult;
       const numChars = Math.max(3, Math.floor(circ / avgW));
-      const ringT  = numRings > 1 ? ring / (numRings - 1) : 0;
-      const rScale = 0.75 + 0.25 * (1 - ringT);
+      const ringT    = numRings > 1 ? ring / (numRings - 1) : 0;
+      const rScale   = 0.75 + 0.25 * (1 - ringT);
+      let lastFont   = '';
 
       for (let i = 0; i < numChars; i++) {
         const cf    = i / numChars;
@@ -538,24 +555,30 @@
         const d1 = Math.abs(((cf - fadePosFrac + 1.5) % 1) - 0.5) * 2;
         const d2 = Math.abs(((cf - (fadePosFrac + 0.5) + 1.5) % 1) - 0.5) * 2;
         const ff = Math.max(
-          Math.max(0, 1 - (d1 / Math.max(0.001, fadeWidth))),
-          Math.max(0, 1 - (d2 / Math.max(0.001, fadeWidth)))
+          Math.max(0, 1 - d1 / fadeWClamped),
+          Math.max(0, 1 - d2 / fadeWClamped)
         );
 
-        const alpha    = Math.max(0, Math.min(1, 1 - fadeStr * ff));
+        const alpha = Math.max(0, Math.min(1, 1 - fadeStr * ff));
+
+        // Skip fully invisible letters entirely
+        if (alpha < 0.005) continue;
+
         const sc       = 1 - shrinkStr * ff;
         const fontSize = baseFontSize * rScale * sc;
         const ch       = textChars[(ring * 13 + i) % textChars.length];
         const px       = cx0 + Math.cos(angle) * radius;
         const py       = cy0 + Math.sin(angle) * radius;
 
+        // Only update font string when it actually changes
+        const fontStr = `${fontSize.toFixed(1)}px ${fontFamily}`;
+        if (fontStr !== lastFont) { ctx.font = fontStr; lastFont = fontStr; }
+
         ctx.save();
         ctx.translate(px, py);
         ctx.rotate(angle + Math.PI / 2);
-        ctx.font      = `${fontSize}px ${fontFamily}`;
-        ctx.fillStyle = `rgba(${tr},${tg},${tb},${alpha})`;
-        ctx.textAlign    = 'center';
-        ctx.textBaseline = 'middle';
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle   = `rgb(${tr},${tg},${tb})`;
         ctx.fillText(ch, 0, 0);
         ctx.restore();
 
@@ -563,6 +586,7 @@
       }
     }
 
+    ctx.globalAlpha = 1;
     lastSVGData = { W, H, bg, textColor: get('tc').value, letters: svgLetters };
   }
 
