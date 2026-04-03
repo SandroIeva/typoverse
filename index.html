@@ -528,64 +528,69 @@
     if (uppercase) rawText = rawText.toUpperCase();
     const textChars = rawText.split('').filter(c => c !== ' ');
 
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Clear canvas — work in raw pixel space, apply dpr via setTransform per letter
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, cv.width, cv.height);
 
-    const svgLetters = [];
-    const fadeWClamped = Math.max(0.001, fadeWidth);
-
-    // Set non-changing canvas state once
+    // Fixed state — set once
     ctx.textAlign    = 'center';
     ctx.textBaseline = 'middle';
+    ctx.fillStyle    = `rgb(${tr},${tg},${tb})`;
+
+    const svgLetters   = [];
+    const fadeWClamped = Math.max(0.001, fadeWidth);
+    const TWO_PI       = Math.PI * 2;
+    const HALF_PI      = Math.PI / 2;
+    let   lastAlpha    = -1;
+    let   lastFont     = '';
 
     for (let ring = 0; ring < numRings; ring++) {
       const radius   = startRadius + ring * ringGap;
-      const circ     = 2 * Math.PI * radius;
+      const circ     = TWO_PI * radius;
       const avgW     = baseFontSize * 0.52 * lsMult;
       const numChars = Math.max(3, Math.floor(circ / avgW));
       const ringT    = numRings > 1 ? ring / (numRings - 1) : 0;
       const rScale   = 0.75 + 0.25 * (1 - ringT);
-      let lastFont   = '';
 
       for (let i = 0; i < numChars; i++) {
         const cf    = i / numChars;
-        const angle = cf * 2 * Math.PI - Math.PI / 2;
+        const angle = cf * TWO_PI - HALF_PI;
 
         const d1 = Math.abs(((cf - fadePosFrac + 1.5) % 1) - 0.5) * 2;
         const d2 = Math.abs(((cf - (fadePosFrac + 0.5) + 1.5) % 1) - 0.5) * 2;
-        const ff = Math.max(
+        const ff  = Math.max(
           Math.max(0, 1 - d1 / fadeWClamped),
           Math.max(0, 1 - d2 / fadeWClamped)
         );
 
         const alpha = Math.max(0, Math.min(1, 1 - fadeStr * ff));
-
-        // Skip fully invisible letters entirely
         if (alpha < 0.005) continue;
 
-        const sc       = 1 - shrinkStr * ff;
-        const fontSize = baseFontSize * rScale * sc;
+        const fontSize = baseFontSize * rScale * (1 - shrinkStr * ff);
         const ch       = textChars[(ring * 13 + i) % textChars.length];
-        const px       = cx0 + Math.cos(angle) * radius;
-        const py       = cy0 + Math.sin(angle) * radius;
+        const wx       = cx0 + Math.cos(angle) * radius;
+        const wy       = cy0 + Math.sin(angle) * radius;
+        const rot      = angle + HALF_PI;
+        const cos      = Math.cos(rot);
+        const sin      = Math.sin(rot);
 
-        // Only update font string when it actually changes
+        // Only update when value changes
         const fontStr = `${fontSize.toFixed(1)}px ${fontFamily}`;
         if (fontStr !== lastFont) { ctx.font = fontStr; lastFont = fontStr; }
 
-        ctx.save();
-        ctx.translate(px, py);
-        ctx.rotate(angle + Math.PI / 2);
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle   = `rgb(${tr},${tg},${tb})`;
-        ctx.fillText(ch, 0, 0);
-        ctx.restore();
+        const alphaR = (alpha * 1000 | 0) / 1000;
+        if (alphaR !== lastAlpha) { ctx.globalAlpha = alphaR; lastAlpha = alphaR; }
 
-        svgLetters.push({ x: px, y: py, angle, fontSize, alpha, ch, fontFamily });
+        // No save/restore — encode position+rotation directly into transform matrix
+        ctx.setTransform(cos * dpr, sin * dpr, -sin * dpr, cos * dpr, wx * dpr, wy * dpr);
+        ctx.fillText(ch, 0, 0);
+
+        svgLetters.push({ x: wx, y: wy, angle, fontSize, alpha, ch, fontFamily });
       }
     }
 
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
     lastSVGData = { W, H, bg, textColor: get('tc').value, letters: svgLetters };
   }
